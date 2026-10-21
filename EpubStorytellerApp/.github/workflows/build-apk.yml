@@ -18,8 +18,9 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Configurar Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Aceitar licenças do Android SDK pré-instalado no runner
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Configurar Gradle
         uses: gradle/actions/setup-gradle@v3
@@ -31,7 +32,7 @@ jobs:
           if [ -f "EpubStorytellerApp/settings.gradle.kts" ]; then
             cd EpubStorytellerApp
           fi
-          gradle assembleDebug --no-daemon
+          gradle assembleDebug --no-daemon --stacktrace
 
       - name: Publicar APK para Download
         uses: actions/upload-artifact@v4
