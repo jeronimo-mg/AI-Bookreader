@@ -1,0 +1,21 @@
+# Ignorar artefatos de compilação do Android e Gradle
+.gradle/
+**/build/
+local.properties
+
+# Ignorar arquivos do Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Ignorar arquivos de sistema e chaves locais
+.DS_Store
+Thumbs.db
+*.keystore
+*.jks
+/tmp/
