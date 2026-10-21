@@ -10,6 +10,7 @@ import com.example.epubstoryteller.model.EpubBook
 import com.example.epubstoryteller.model.StorytellerVoices
 import com.example.epubstoryteller.model.VoiceOption
 import com.example.epubstoryteller.network.GeminiLiveStorytellerClient
+import com.example.epubstoryteller.service.StorytellerPlaybackService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -49,9 +50,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private val liveClient = GeminiLiveStorytellerClient(
         onParagraphStarted = { index ->
             _uiState.update { it.copy(currentParagraphIndex = index, liveTranscript = "", errorMessage = null) }
+            syncForegroundService(isPlaying = true, paragraphIndex = index)
         },
         onParagraphFinished = { finishedIndex ->
-            // Avança automaticamente para o próximo parágrafo e salva o progresso
             val book = _uiState.value.book ?: return@GeminiLiveStorytellerClient
             val nextIndex = finishedIndex + 1
             if (nextIndex <= book.paragraphs.lastIndex && _uiState.value.isPlaying) {
@@ -60,6 +61,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 speakParagraphAt(nextIndex)
             } else {
                 _uiState.update { it.copy(isPlaying = false, connectionStatus = "Fim do livro alcançado") }
+                syncForegroundService(isPlaying = false, paragraphIndex = finishedIndex)
             }
         },
         onTranscriptChunk = { chunk ->
@@ -72,12 +74,36 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         },
         onError = { error ->
             _uiState.update { it.copy(errorMessage = error, isPlaying = false) }
+            syncForegroundService(isPlaying = false, paragraphIndex = _uiState.value.currentParagraphIndex)
         }
     )
 
     init {
+        // Registra callbacks para os controles da notificação na tela de bloqueio / segundo plano
+        StorytellerPlaybackService.onTogglePlayPauseCommand = { togglePlayPause() }
+        StorytellerPlaybackService.onPrevParagraphCommand = { skipRelative(-1) }
+        StorytellerPlaybackService.onNextParagraphCommand = { skipRelative(1) }
+
         loadBundledSampleEpub()
         refreshExtendedVoicesIfKeyPresent()
+    }
+
+    private fun syncForegroundService(isPlaying: Boolean, paragraphIndex: Int) {
+        val app = getApplication<Application>()
+        val book = _uiState.value.book
+        val paragraph = book?.paragraphs?.getOrNull(paragraphIndex)
+        val title = book?.title ?: "EPUB Storyteller"
+        val subtitle = if (paragraph != null) {
+            "Parágrafo #${paragraphIndex + 1} • ${paragraph.chapterTitle}"
+        } else {
+            "Parágrafo #${paragraphIndex + 1}"
+        }
+        StorytellerPlaybackService.startOrUpdate(
+            context = app,
+            bookTitle = title,
+            subtitle = subtitle,
+            isPlaying = isPlaying
+        )
     }
 
     fun loadBundledSampleEpub() {
@@ -161,16 +187,10 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
         _uiState.update { it.copy(isPlaying = true, errorMessage = null) }
         progressStore.saveBookPosition(book.bookId, state.currentParagraphIndex)
+        syncForegroundService(isPlaying = true, paragraphIndex = state.currentParagraphIndex)
         speakParagraphAt(state.currentParagraphIndex)
     }
 
-    /**
-     * Permite ao usuário escolher um novo ponto inicial de leitura a qualquer momento,
-     * INCLUSIVE durante a leitura em voz alta:
-     * - Salva imediatamente a nova posição no armazenamento persistente.
-     * - Se já estiver lendo (ou se `startReadingImmediately == true`), interrompe o áudio atual na hora
-     *   e começa a narrar a partir do parágrafo escolhido.
-     */
     fun selectReadingPoint(paragraphIndex: Int, startReadingImmediately: Boolean = _uiState.value.isPlaying) {
         val book = _uiState.value.book ?: return
         val clampedIndex = paragraphIndex.coerceIn(0, (book.paragraphs.size - 1).coerceAtLeast(0))
@@ -190,6 +210,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 return
             }
             _uiState.update { it.copy(isPlaying = true, errorMessage = null) }
+            syncForegroundService(isPlaying = true, paragraphIndex = clampedIndex)
             speakParagraphAt(clampedIndex)
         }
     }
@@ -202,6 +223,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     fun pause() {
         liveClient.pausePlayback()
         _uiState.update { it.copy(isPlaying = false) }
+        syncForegroundService(isPlaying = false, paragraphIndex = _uiState.value.currentParagraphIndex)
     }
 
     private fun speakParagraphAt(index: Int) {
@@ -234,7 +256,6 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
         refreshExtendedVoicesIfKeyPresent()
 
-        // Se estava lendo quando trocou a voz, reconecta e continua do parágrafo atual com a nova voz
         if (wasPlaying) {
             speakParagraphAt(_uiState.value.currentParagraphIndex)
         }
@@ -262,6 +283,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         super.onCleared()
+        StorytellerPlaybackService.stop(getApplication())
         liveClient.release()
     }
 }

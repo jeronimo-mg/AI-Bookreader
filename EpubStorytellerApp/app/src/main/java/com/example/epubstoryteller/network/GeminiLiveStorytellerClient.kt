@@ -24,18 +24,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Cliente WebSocket bidirecional para o modelo `gemini-3.8-live` via API oficial BidiGenerateContent:
- * wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=API_KEY
+ * Cliente WebSocket bidirecional para o modelo `gemini-3.8-live` via API oficial BidiGenerateContent.
  *
- * Recursos implementados conforme a documentação oficial do Gemini 3.8 Live:
- * 1. Modelo: "models/gemini-3.8-live" (sem thinkingConfig/thinkingLevel e sem enableAffectiveDialog).
- * 2. Voz e Idioma: speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName + languageCode = "pt-BR" (quando português).
- * 3. Estilo Storyteller: systemInstruction exigindo sotaque e prosódia de contador de histórias em Português Brasileiro (pt-BR),
- *    inclusive adaptando a pronúncia quando o texto escrito estiver na grafia lusitana (como na edição Bertrand de O Código Da Vinci).
- * 4. Troca imediata do ponto de leitura mesmo durante a fala:
- *    - Envia `turnComplete = true` com o novo trecho (que no Gemini 3.8 Live interrompe incondicionalmente a geração anterior no servidor)
- *    - Dá `pause()` + `flush()` imediato no `AudioTrack` local e incrementa o `utteranceGenerationId` para descartar pacotes residuais do turno anterior.
- * 5. Renovação preventiva da sessão antes do limite de 15 minutos da Live API entre parágrafos.
+ * Inclui:
+ * - Suporte a execução em segundo plano / tela desligada em conjunto com `StorytellerPlaybackService`.
+ * - Reconexão automática transparente caso ocorra queda momentânea de socket ("Software caused connection abort"
+ *   ou transição Wi-Fi / Dados Móveis) enquanto `isPlaying == true`, retomando automaticamente o parágrafo ativo.
  */
 class GeminiLiveStorytellerClient(
     private val onParagraphStarted: (Int) -> Unit,
@@ -46,14 +40,16 @@ class GeminiLiveStorytellerClient(
 ) {
     companion object {
         private const val MODEL_NAME = "models/gemini-3.8-live"
-        private const val SAMPLE_RATE_HZ = 24000 // Gemini 3.8 Live sempre emite PCM 16-bit 24kHz little-endian mono
-        private const val SESSION_MAX_AGE_MS = 12 * 60 * 1000L // Renova preventivamente aos 12 min (limite da API é 15 min)
+        private const val SAMPLE_RATE_HZ = 24000
+        private const val SESSION_MAX_AGE_MS = 12 * 60 * 1000L
+        private const val MAX_AUTO_RECONNECT_ATTEMPTS = 5
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val okHttpClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private var webSocket: WebSocket? = null
@@ -63,13 +59,16 @@ class GeminiLiveStorytellerClient(
     private val isSetupComplete = AtomicBoolean(false)
     private val isPlaying = AtomicBoolean(false)
     private val activeParagraphIndex = AtomicInteger(-1)
+    private var activeParagraphText: String = ""
     private val utteranceGenerationId = AtomicInteger(0)
+    private val reconnectAttempts = AtomicInteger(0)
 
     private var currentApiKey: String = ""
     private var currentVoiceName: String = "Sulafat"
     private var currentLanguageCode: String = "pt-BR"
     private var pendingParagraphToSpeak: Pair<Int, String>? = null
     private var completionMonitorJob: Job? = null
+    private var reconnectJob: Job? = null
 
     private fun ensureAudioTrack(): AudioTrack {
         val existing = audioTrack
@@ -117,11 +116,12 @@ class GeminiLiveStorytellerClient(
             return
         }
 
+        reconnectJob?.cancel()
         isPlaying.set(true)
         activeParagraphIndex.set(paragraphIndex)
+        activeParagraphText = paragraphText
         val genId = utteranceGenerationId.incrementAndGet()
 
-        // Interrompe imediatamente qualquer áudio em reprodução no buffer local (permite trocar de parágrafo durante a leitura!)
         flushLocalAudioBuffer()
 
         val sessionExpired = (System.currentTimeMillis() - sessionConnectedAtMs) > SESSION_MAX_AGE_MS
@@ -139,43 +139,86 @@ class GeminiLiveStorytellerClient(
     }
 
     private fun openNewWebSocketSession() {
-        webSocket?.cancel()
+        val oldSocket = webSocket
+        webSocket = null
+        oldSocket?.cancel()
+
         isSetupComplete.set(false)
         onConnectionStatusChanged("Conectando ao Gemini 3.8 Live...")
 
         val wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$currentApiKey"
         val request = Request.Builder().url(wsUrl).build()
 
-        webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
+        val newSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(ws: WebSocket, response: Response) {
+                if (ws !== webSocket) return
                 sessionConnectedAtMs = System.currentTimeMillis()
-                onConnectionStatusChanged("Enviando configuração Storyteller ($currentLanguageCode)...")
+                onConnectionStatusChanged("Configurando Storyteller ($currentLanguageCode)...")
                 val setupJson = buildSetupMessageJson(
                     voiceName = currentVoiceName,
                     languageBcp47 = currentLanguageCode
                 )
-                webSocket.send(setupJson)
+                ws.send(setupJson)
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
+            override fun onMessage(ws: WebSocket, text: String) {
+                if (ws !== webSocket) return
                 handleServerMessage(text)
             }
 
-            override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
+            override fun onMessage(ws: WebSocket, bytes: okio.ByteString) {
+                if (ws !== webSocket) return
                 handleServerMessage(bytes.utf8())
             }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                if (ws !== webSocket) return
                 isSetupComplete.set(false)
-                onConnectionStatusChanged("Desconectado")
-                onError("Erro na conexão Live API: ${t.localizedMessage ?: "Falha de rede"}")
+                handleUnexpectedDisconnect(t.localizedMessage ?: "Queda de conexão")
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                if (ws !== webSocket) return
                 isSetupComplete.set(false)
-                onConnectionStatusChanged("Sessão encerrada ($code)")
+                if (isPlaying.get() && code != 1000) {
+                    handleUnexpectedDisconnect("Sessão encerrada ($code)")
+                } else {
+                    onConnectionStatusChanged("Sessão encerrada ($code)")
+                }
             }
         })
+        webSocket = newSocket
+    }
+
+    /**
+     * Caso o sistema operacional ou a rede derrube momentaneamente a conexão
+     * (ex.: "Software caused connection abort" na transição de rede ou bloqueio de tela),
+     * reconecta automaticamente em segundo plano e retoma o parágrafo atual sem interromper a experiência.
+     */
+    private fun handleUnexpectedDisconnect(reason: String) {
+        if (!isPlaying.get()) {
+            onConnectionStatusChanged("Desconectado")
+            return
+        }
+
+        val attempt = reconnectAttempts.incrementAndGet()
+        if (attempt <= MAX_AUTO_RECONNECT_ATTEMPTS) {
+            val targetIdx = activeParagraphIndex.get()
+            val targetText = activeParagraphText
+            onConnectionStatusChanged("Reconectando automaticamente ($attempt/$MAX_AUTO_RECONNECT_ATTEMPTS)...")
+            reconnectJob?.cancel()
+            reconnectJob = scope.launch {
+                delay(1200L * attempt)
+                if (isPlaying.get() && targetIdx >= 0 && targetText.isNotEmpty()) {
+                    pendingParagraphToSpeak = targetIdx to targetText
+                    openNewWebSocketSession()
+                }
+            }
+        } else {
+            reconnectAttempts.set(0)
+            onConnectionStatusChanged("Desconectado")
+            onError("Erro na conexão Live API após várias tentativas: $reason")
+        }
     }
 
     private fun buildSetupMessageJson(voiceName: String, languageBcp47: String): String {
@@ -199,8 +242,6 @@ class GeminiLiveStorytellerClient(
             """.trimIndent()
         }
 
-        // Estrutura oficial BidiGenerateContentSetup para gemini-3.8-live:
-        // Nota: thinkingConfig e enableAffectiveDialog NÃO são incluídos pois retornam erro no gemini-3.8-live.
         val setupObj = JSONObject().apply {
             put("model", MODEL_NAME)
             put("generationConfig", JSONObject().apply {
@@ -219,13 +260,11 @@ class GeminiLiveStorytellerClient(
                     put("text", storytellerPrompt)
                 }))
             })
-            // Desativa VAD automático pois o app envia turnos de texto determinísticos via clientContent
             put("realtimeInputConfig", JSONObject().apply {
                 put("automaticActivityDetection", JSONObject().apply {
                     put("disabled", true)
                 })
             })
-            // Habilita transcrição do áudio de saída para acompanhamento em tempo real
             put("outputAudioTranscription", JSONObject())
         }
 
@@ -237,8 +276,6 @@ class GeminiLiveStorytellerClient(
         onConnectionStatusChanged("Narrando parágrafo #${paragraphIndex + 1}")
         onParagraphStarted(paragraphIndex)
 
-        // No Gemini 3.8 Live, enviar clientContent com turnComplete=true interrompe imediatamente
-        // qualquer geração anterior em andamento e inicia a leitura do novo ponto escolhido.
         val promptText = "NARRE LITERALMENTE ESTE TRECHO:\n\n$paragraphText"
         val clientContentMsg = JSONObject().apply {
             put("clientContent", JSONObject().apply {
@@ -252,7 +289,10 @@ class GeminiLiveStorytellerClient(
             })
         }
 
-        ws.send(clientContentMsg.toString())
+        val sent = ws.send(clientContentMsg.toString())
+        if (!sent && isPlaying.get()) {
+            handleUnexpectedDisconnect("Falha ao enviar trecho no socket")
+        }
     }
 
     private fun handleServerMessage(rawJson: String) {
@@ -260,9 +300,9 @@ class GeminiLiveStorytellerClient(
         try {
             val root = JSONObject(rawJson)
 
-            // 1. Confirmação de setupComplete da Live API
             if (root.has("setupComplete")) {
                 isSetupComplete.set(true)
+                reconnectAttempts.set(0)
                 onConnectionStatusChanged("Conectado (Gemini 3.8 Live)")
                 val pending = pendingParagraphToSpeak
                 pendingParagraphToSpeak = null
@@ -272,10 +312,8 @@ class GeminiLiveStorytellerClient(
                 return
             }
 
-            // 2. Conteúdo de áudio/transcrição do servidor
             val serverContent = root.optJSONObject("serverContent") ?: return
 
-            // Se o usuário já clicou em outro parágrafo ou pausou, ignora pacotes atrasados
             if (!isPlaying.get() || expectedGenId != utteranceGenerationId.get()) {
                 return
             }
@@ -290,6 +328,7 @@ class GeminiLiveStorytellerClient(
                         if (inlineData != null) {
                             val b64Audio = inlineData.optString("data", "")
                             if (b64Audio.isNotEmpty() && expectedGenId == utteranceGenerationId.get()) {
+                                reconnectAttempts.set(0)
                                 val pcmBytes = Base64.decode(b64Audio, Base64.DEFAULT)
                                 writePcmToAudioTrack(pcmBytes, expectedGenId)
                             }
@@ -311,7 +350,6 @@ class GeminiLiveStorytellerClient(
                 val finishedIdx = activeParagraphIndex.get()
                 completionMonitorJob?.cancel()
                 completionMonitorJob = scope.launch {
-                    // Aguarda um pequeno intervalo para o buffer do AudioTrack concluir as últimas amostras do parágrafo
                     delay(250)
                     if (isPlaying.get() && expectedGenId == utteranceGenerationId.get()) {
                         onParagraphFinished(finishedIdx)
@@ -334,6 +372,8 @@ class GeminiLiveStorytellerClient(
 
     fun pausePlayback() {
         isPlaying.set(false)
+        reconnectAttempts.set(0)
+        reconnectJob?.cancel()
         utteranceGenerationId.incrementAndGet()
         completionMonitorJob?.cancel()
         flushLocalAudioBuffer()
@@ -353,10 +393,6 @@ class GeminiLiveStorytellerClient(
         }
     }
 
-    /**
-     * Consulta opcionalmente a Extended Voice Library da API Gemini 3.8 (`GET /v1beta/voices`)
-     * filtrando por `language_code=pt-BR` e `context=Audiobook` para listar vozes adicionais.
-     */
     suspend fun fetchExtendedPtBrStorytellerVoices(apiKey: String): List<VoiceOption> = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext emptyList()
         val url = "https://generativelanguage.googleapis.com/v1beta/voices?language_code=pt-BR&context=Audiobook&page_size=50"
@@ -390,8 +426,9 @@ class GeminiLiveStorytellerClient(
 
     fun release() {
         pausePlayback()
-        webSocket?.close(1000, "App closed")
+        val oldSocket = webSocket
         webSocket = null
+        oldSocket?.close(1000, "App closed")
         audioTrack?.release()
         audioTrack = null
     }
