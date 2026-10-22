@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -26,10 +27,17 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * Cliente WebSocket bidirecional para o modelo `gemini-3.8-live` via API oficial BidiGenerateContent.
  *
- * Inclui:
- * - Suporte a execução em segundo plano / tela desligada em conjunto com `StorytellerPlaybackService`.
- * - Reconexão automática transparente caso ocorra queda momentânea de socket ("Software caused connection abort"
- *   ou transição Wi-Fi / Dados Móveis) enquanto `isPlaying == true`, retomando automaticamente o parágrafo ativo.
+ * Correções críticas de estabilidade para parágrafos longos (como em "O Retrato de Dorian Gray"):
+ * 1. Fila Assíncrona de Áudio (`Channel<AudioQueueItem>`):
+ *    - Antes, `AudioTrack.write(..., WRITE_BLOCKING)` era chamado diretamente na thread de leitura do WebSocket (`onMessage`).
+ *    - Como o Gemini 3.8 Live gera o áudio muito mais rápido que o tempo real, em parágrafos longos (>15s de fala, como o 2º parágrafo
+ *      do Capítulo I de Dorian Gray com 958 caracteres), o buffer do `AudioTrack` enchia e bloqueava a thread do WebSocket!
+ *    - Com a thread do WebSocket bloqueada, o OkHttp não conseguia ler os pacotes `PONG` do `pingInterval`, disparando timeout no meio
+ *      do parágrafo e reconectando/reiniciando o mesmo parágrafo em loop infinito.
+ *    - Agora, `onMessage` nunca bloqueia: ele apenas enfileira os pacotes PCM em uma `Channel` consumida por uma coroutine dedicada de áudio.
+ * 2. Subdivisão inteligente de parágrafos longos por frases (`splitIntoSpeechSegments`):
+ *    - Parágrafos muito extensos (ex: >380 caracteres, chegando a 3.500 caracteres em Dorian Gray) são subdivididos em blocos naturais de
+ *      frases (~350 caracteres) enviados sequencialmente dentro do mesmo parágrafo, garantindo fluidez contínua e zero cortes.
  */
 class GeminiLiveStorytellerClient(
     private val onParagraphStarted: (Int) -> Unit,
@@ -43,12 +51,23 @@ class GeminiLiveStorytellerClient(
         private const val SAMPLE_RATE_HZ = 24000
         private const val SESSION_MAX_AGE_MS = 12 * 60 * 1000L
         private const val MAX_AUTO_RECONNECT_ATTEMPTS = 5
+        private const val MAX_SEGMENT_CHARS = 380
+    }
+
+    private sealed class AudioQueueItem {
+        data class PcmChunk(val pcmBytes: ByteArray, val genId: Int) : AudioQueueItem()
+        data class SegmentTurnComplete(
+            val paragraphIndex: Int,
+            val segmentIndex: Int,
+            val totalSegments: Int,
+            val genId: Int
+        ) : AudioQueueItem()
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val okHttpClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(15, TimeUnit.SECONDS)
+        .pingInterval(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
@@ -59,16 +78,62 @@ class GeminiLiveStorytellerClient(
     private val isSetupComplete = AtomicBoolean(false)
     private val isPlaying = AtomicBoolean(false)
     private val activeParagraphIndex = AtomicInteger(-1)
-    private var activeParagraphText: String = ""
+    private var activeSegments: List<String> = emptyList()
+    private val activeSegmentIndex = AtomicInteger(0)
     private val utteranceGenerationId = AtomicInteger(0)
     private val reconnectAttempts = AtomicInteger(0)
 
     private var currentApiKey: String = ""
     private var currentVoiceName: String = "Sulafat"
     private var currentLanguageCode: String = "pt-BR"
-    private var pendingParagraphToSpeak: Pair<Int, String>? = null
-    private var completionMonitorJob: Job? = null
+    private var pendingSpeakRequest: Boolean = false
     private var reconnectJob: Job? = null
+
+    private var audioChannel = Channel<AudioQueueItem>(Channel.UNLIMITED)
+    private var audioConsumerJob: Job? = null
+
+    init {
+        startAudioConsumerLoop()
+    }
+
+    private fun startAudioConsumerLoop() {
+        audioConsumerJob?.cancel()
+        audioConsumerJob = scope.launch(Dispatchers.IO) {
+            for (item in audioChannel) {
+                if (!isPlaying.get()) continue
+                when (item) {
+                    is AudioQueueItem.PcmChunk -> {
+                        if (item.genId == utteranceGenerationId.get()) {
+                            writePcmToAudioTrackBlocking(item.pcmBytes, item.genId)
+                        }
+                    }
+                    is AudioQueueItem.SegmentTurnComplete -> {
+                        if (item.genId == utteranceGenerationId.get() && isPlaying.get()) {
+                            val nextSegIdx = item.segmentIndex + 1
+                            if (nextSegIdx < item.totalSegments) {
+                                // Avança imediatamente para o próximo bloco de frases dentro do mesmo parágrafo
+                                activeSegmentIndex.set(nextSegIdx)
+                                sendCurrentSegmentTurn(item.genId)
+                            } else {
+                                // Parágrafo inteiro concluído: aguarda esvaziar o buffer final do AudioTrack e avança de parágrafo
+                                delay(220)
+                                if (isPlaying.get() && item.genId == utteranceGenerationId.get()) {
+                                    onParagraphFinished(item.paragraphIndex)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resetAudioQueue() {
+        val oldChannel = audioChannel
+        audioChannel = Channel(Channel.UNLIMITED)
+        oldChannel.cancel()
+        startAudioConsumerLoop()
+    }
 
     private fun ensureAudioTrack(): AudioTrack {
         val existing = audioTrack
@@ -119,10 +184,13 @@ class GeminiLiveStorytellerClient(
         reconnectJob?.cancel()
         isPlaying.set(true)
         activeParagraphIndex.set(paragraphIndex)
-        activeParagraphText = paragraphText
+        activeSegments = splitIntoSpeechSegments(paragraphText)
+        activeSegmentIndex.set(0)
         val genId = utteranceGenerationId.incrementAndGet()
 
+        resetAudioQueue()
         flushLocalAudioBuffer()
+        onParagraphStarted(paragraphIndex)
 
         val sessionExpired = (System.currentTimeMillis() - sessionConnectedAtMs) > SESSION_MAX_AGE_MS
         val configChanged = apiKey != currentApiKey || voiceName != currentVoiceName || languageBcp47 != currentLanguageCode
@@ -131,11 +199,42 @@ class GeminiLiveStorytellerClient(
             currentApiKey = apiKey
             currentVoiceName = voiceName
             currentLanguageCode = languageBcp47
-            pendingParagraphToSpeak = paragraphIndex to paragraphText
+            pendingSpeakRequest = true
             openNewWebSocketSession()
         } else {
-            sendSpeakTurn(paragraphIndex, paragraphText, genId)
+            sendCurrentSegmentTurn(genId)
         }
+    }
+
+    /**
+     * Divide parágrafos muito longos (ex: >380 caracteres) em blocos naturais de frases (terminadas em ., !, ?, ;, :)
+     * para evitar turnos gigantescos na Live API e manter a entonação consistente do início ao fim do parágrafo.
+     */
+    private fun splitIntoSpeechSegments(text: String): List<String> {
+        val cleaned = text.trim()
+        if (cleaned.length <= MAX_SEGMENT_CHARS) {
+            return listOf(cleaned)
+        }
+
+        val sentences = cleaned.split(Regex("(?<=[.!?;:])\\s+"))
+        val segments = mutableListOf<String>()
+        val current = StringBuilder()
+
+        for (sentence in sentences) {
+            if (current.isEmpty()) {
+                current.append(sentence)
+            } else if (current.length + 1 + sentence.length <= MAX_SEGMENT_CHARS) {
+                current.append(" ").append(sentence)
+            } else {
+                segments.add(current.toString())
+                current.clear()
+                current.append(sentence)
+            }
+        }
+        if (current.isNotEmpty()) {
+            segments.add(current.toString())
+        }
+        return segments.ifEmpty { listOf(cleaned) }
     }
 
     private fun openNewWebSocketSession() {
@@ -163,12 +262,12 @@ class GeminiLiveStorytellerClient(
 
             override fun onMessage(ws: WebSocket, text: String) {
                 if (ws !== webSocket) return
-                handleServerMessage(text)
+                handleServerMessageNonBlocking(text)
             }
 
             override fun onMessage(ws: WebSocket, bytes: okio.ByteString) {
                 if (ws !== webSocket) return
-                handleServerMessage(bytes.utf8())
+                handleServerMessageNonBlocking(bytes.utf8())
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
@@ -190,11 +289,6 @@ class GeminiLiveStorytellerClient(
         webSocket = newSocket
     }
 
-    /**
-     * Caso o sistema operacional ou a rede derrube momentaneamente a conexão
-     * (ex.: "Software caused connection abort" na transição de rede ou bloqueio de tela),
-     * reconecta automaticamente em segundo plano e retoma o parágrafo atual sem interromper a experiência.
-     */
     private fun handleUnexpectedDisconnect(reason: String) {
         if (!isPlaying.get()) {
             onConnectionStatusChanged("Desconectado")
@@ -203,21 +297,19 @@ class GeminiLiveStorytellerClient(
 
         val attempt = reconnectAttempts.incrementAndGet()
         if (attempt <= MAX_AUTO_RECONNECT_ATTEMPTS) {
-            val targetIdx = activeParagraphIndex.get()
-            val targetText = activeParagraphText
-            onConnectionStatusChanged("Reconectando automaticamente ($attempt/$MAX_AUTO_RECONNECT_ATTEMPTS)...")
+            onConnectionStatusChanged("Reconectando ($attempt/$MAX_AUTO_RECONNECT_ATTEMPTS)...")
             reconnectJob?.cancel()
             reconnectJob = scope.launch {
-                delay(1200L * attempt)
-                if (isPlaying.get() && targetIdx >= 0 && targetText.isNotEmpty()) {
-                    pendingParagraphToSpeak = targetIdx to targetText
+                delay(1000L * attempt)
+                if (isPlaying.get() && activeParagraphIndex.get() >= 0 && activeSegments.isNotEmpty()) {
+                    pendingSpeakRequest = true
                     openNewWebSocketSession()
                 }
             }
         } else {
             reconnectAttempts.set(0)
             onConnectionStatusChanged("Desconectado")
-            onError("Erro na conexão Live API após várias tentativas: $reason")
+            onError("Erro na conexão Live API: $reason")
         }
     }
 
@@ -271,12 +363,17 @@ class GeminiLiveStorytellerClient(
         return JSONObject().put("setup", setupObj).toString()
     }
 
-    private fun sendSpeakTurn(paragraphIndex: Int, paragraphText: String, genId: Int) {
+    private fun sendCurrentSegmentTurn(genId: Int) {
         val ws = webSocket ?: return
-        onConnectionStatusChanged("Narrando parágrafo #${paragraphIndex + 1}")
-        onParagraphStarted(paragraphIndex)
+        val paraIdx = activeParagraphIndex.get()
+        val segIdx = activeSegmentIndex.get()
+        val segments = activeSegments
+        val segmentText = segments.getOrNull(segIdx) ?: return
 
-        val promptText = "NARRE LITERALMENTE ESTE TRECHO:\n\n$paragraphText"
+        val segLabel = if (segments.size > 1) " (parte ${segIdx + 1}/${segments.size})" else ""
+        onConnectionStatusChanged("Narrando parágrafo #${paraIdx + 1}$segLabel")
+
+        val promptText = "NARRE LITERALMENTE ESTE TRECHO:\n\n$segmentText"
         val clientContentMsg = JSONObject().apply {
             put("clientContent", JSONObject().apply {
                 put("turns", JSONArray().put(JSONObject().apply {
@@ -295,7 +392,11 @@ class GeminiLiveStorytellerClient(
         }
     }
 
-    private fun handleServerMessage(rawJson: String) {
+    /**
+     * Executado na thread do WebSocket: NUNCA bloqueia!
+     * Apenas decodifica o Base64 e envia para a `audioChannel` (memória) em microssegundos.
+     */
+    private fun handleServerMessageNonBlocking(rawJson: String) {
         val expectedGenId = utteranceGenerationId.get()
         try {
             val root = JSONObject(rawJson)
@@ -304,10 +405,9 @@ class GeminiLiveStorytellerClient(
                 isSetupComplete.set(true)
                 reconnectAttempts.set(0)
                 onConnectionStatusChanged("Conectado (Gemini 3.8 Live)")
-                val pending = pendingParagraphToSpeak
-                pendingParagraphToSpeak = null
-                if (pending != null && isPlaying.get()) {
-                    sendSpeakTurn(pending.first, pending.second, expectedGenId)
+                if (pendingSpeakRequest && isPlaying.get()) {
+                    pendingSpeakRequest = false
+                    sendCurrentSegmentTurn(expectedGenId)
                 }
                 return
             }
@@ -330,7 +430,7 @@ class GeminiLiveStorytellerClient(
                             if (b64Audio.isNotEmpty() && expectedGenId == utteranceGenerationId.get()) {
                                 reconnectAttempts.set(0)
                                 val pcmBytes = Base64.decode(b64Audio, Base64.DEFAULT)
-                                writePcmToAudioTrack(pcmBytes, expectedGenId)
+                                audioChannel.trySend(AudioQueueItem.PcmChunk(pcmBytes, expectedGenId))
                             }
                         }
                     }
@@ -347,35 +447,44 @@ class GeminiLiveStorytellerClient(
 
             val turnComplete = serverContent.optBoolean("turnComplete", false)
             if (turnComplete && isPlaying.get() && expectedGenId == utteranceGenerationId.get()) {
-                val finishedIdx = activeParagraphIndex.get()
-                completionMonitorJob?.cancel()
-                completionMonitorJob = scope.launch {
-                    delay(250)
-                    if (isPlaying.get() && expectedGenId == utteranceGenerationId.get()) {
-                        onParagraphFinished(finishedIdx)
-                    }
-                }
+                audioChannel.trySend(
+                    AudioQueueItem.SegmentTurnComplete(
+                        paragraphIndex = activeParagraphIndex.get(),
+                        segmentIndex = activeSegmentIndex.get(),
+                        totalSegments = activeSegments.size,
+                        genId = expectedGenId
+                    )
+                )
             }
         } catch (e: Exception) {
             onError("Erro ao processar resposta do Gemini 3.8 Live: ${e.localizedMessage}")
         }
     }
 
-    private fun writePcmToAudioTrack(pcmBytes: ByteArray, genId: Int) {
+    private fun writePcmToAudioTrackBlocking(pcmBytes: ByteArray, genId: Int) {
         if (!isPlaying.get() || genId != utteranceGenerationId.get()) return
         val track = ensureAudioTrack()
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             track.play()
         }
-        track.write(pcmBytes, 0, pcmBytes.size, AudioTrack.WRITE_BLOCKING)
+        // Escreve em pequenos blocos de 4800 bytes (100ms a 24kHz 16-bit mono) para permitir interrupção imediata
+        var offset = 0
+        val chunkSize = 4800
+        while (offset < pcmBytes.size && isPlaying.get() && genId == utteranceGenerationId.get()) {
+            val len = minOf(chunkSize, pcmBytes.size - offset)
+            val written = track.write(pcmBytes, offset, len, AudioTrack.WRITE_BLOCKING)
+            if (written <= 0) break
+            offset += written
+        }
     }
 
     fun pausePlayback() {
         isPlaying.set(false)
+        pendingSpeakRequest = false
         reconnectAttempts.set(0)
         reconnectJob?.cancel()
         utteranceGenerationId.incrementAndGet()
-        completionMonitorJob?.cancel()
+        resetAudioQueue()
         flushLocalAudioBuffer()
         onConnectionStatusChanged("Pausado")
     }
@@ -426,6 +535,7 @@ class GeminiLiveStorytellerClient(
 
     fun release() {
         pausePlayback()
+        audioConsumerJob?.cancel()
         val oldSocket = webSocket
         webSocket = null
         oldSocket?.close(1000, "App closed")

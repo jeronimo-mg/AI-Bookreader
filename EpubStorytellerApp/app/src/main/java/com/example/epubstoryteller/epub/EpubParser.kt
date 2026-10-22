@@ -6,7 +6,6 @@ import com.example.epubstoryteller.model.EpubParagraph
 import org.jsoup.Jsoup
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
-import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.io.StringReader
 import java.security.MessageDigest
@@ -14,10 +13,10 @@ import java.util.zip.ZipInputStream
 
 class EpubParser {
 
-    // Detecta cabeçalhos de capítulos mesmo quando o EPUB foi convertido de PDF pelo Calibre
-    // (como em "O Codigo da Vinci - Dan Brown.epub", onde "CAPÍTULO UM" aparece colado ao final do parágrafo anterior)
+    // Reconhece apenas numerais reais (romanos, arábicos ou por extenso em português) após "CAPÍTULO",
+    // evitando falsos positivos em frases do texto como "esse capítulo fantástico".
     private val chapterHeadingRegex = Regex(
-        pattern = """\b(PRÓLOGO|PROLOGO|EPÍLOGO|EPILOGO|CAPÍTULO\s+(?:[A-ZÇÃÕÁÉÍÓÚ\d]+(?:\s+E\s+[A-ZÇÃÕÁÉÍÓÚ\d]+)?)|CAPITULO\s+(?:[A-ZÇÃÕÁÉÍÓÚ\d]+(?:\s+E\s+[A-ZÇÃÕÁÉÍÓÚ\d]+)?))\b""",
+        pattern = """(?:^|\s)(PRÓLOGO|PROLOGO|PREFÁCIO|PREFACIO|POSFÁCIO|POSFACIO|EPÍLOGO|EPILOGO|(?:CAPÍTULO|CAPITULO)\s+(?:\d+|[IVXLCDM]+|(?:UM|DOIS|TRÊS|TRES|QUATRO|CINCO|SEIS|SETE|OITO|NOVE|DEZ|ONZE|DOZE|TREZE|CATORZE|QUATORZE|QUINZE|DEZASSEIS|DEZESSEIS|DEZASSETE|DEZESSETE|DEZOITO|DEZANOVE|DEZENOVE|VINTE|TRINTA|QUARENTA|CINQUENTA|SESSENTA|SETENTA|OITENTA|NOVENTA|CEM|CENTO)(?:\s+E\s+(?:UM|DOIS|TRÊS|TRES|QUATRO|CINCO|SEIS|SETE|OITO|NOVE|DEZ|ONZE|DOZE|TREZE|CATORZE|QUATORZE|QUINZE|DEZASSEIS|DEZESSEIS|DEZASSETE|DEZESSETE|DEZOITO|DEZANOVE|DEZENOVE|VINTE|TRINTA|QUARENTA|CINQUENTA|SESSENTA|SETENTA|OITENTA|NOVENTA))*))\s*$""",
         options = setOf(RegexOption.IGNORE_CASE)
     )
 
@@ -34,7 +33,6 @@ class EpubParser {
             }
         }
 
-        // 1. Localiza o caminho do arquivo OPF via META-INF/container.xml
         val containerBytes = entries["META-INF/container.xml"]
             ?: throw IllegalArgumentException("Arquivo EPUB inválido: META-INF/container.xml não encontrado")
         val opfPath = parseContainerXml(String(containerBytes, Charsets.UTF_8))
@@ -44,8 +42,7 @@ class EpubParser {
             ?: throw IllegalArgumentException("Arquivo OPF não encontrado em $opfPath")
         val opfMeta = parseOpf(String(opfBytes, Charsets.UTF_8))
 
-        // 2. Extrai parágrafos na ordem do spine e separa cabeçalhos colados ("...vida que lhe restava. CAPÍTULO UM")
-        val rawParagraphs = mutableListOf<Pair<String, Boolean>>() // (texto, isHeading)
+        val rawParagraphs = mutableListOf<Pair<String, Boolean>>()
 
         for (idref in opfMeta.spineIdRefs) {
             val href = opfMeta.manifest[idref] ?: continue
@@ -58,14 +55,13 @@ class EpubParser {
             for (el in elements) {
                 val cleaned = el.text().replace(Regex("\\s+"), " ").trim()
                 if (cleaned.length < 2) continue
-                // Ignora artefatos de estilo CSS do Calibre
                 if (cleaned.startsWith("@page") || cleaned.equals("index", ignoreCase = true)) continue
 
-                splitEmbeddedChapterHeadings(cleaned, el.tagName().startsWith("h"), rawParagraphs)
+                val isHeaderTag = el.tagName().startsWith("h", ignoreCase = true)
+                splitEmbeddedChapterHeadings(cleaned, isHeaderTag, rawParagraphs)
             }
         }
 
-        // 3. Constrói capítulos (usando os cabeçalhos detectados ou agrupando caso não haja)
         val chapters = mutableListOf<EpubChapter>()
         val finalParagraphs = mutableListOf<EpubParagraph>()
 
@@ -113,8 +109,6 @@ class EpubParser {
             )
         }
 
-        // 4. Detecta idioma: se o OPF tiver "UND" (como no EPUB de teste "O Codigo da Vinci - Dan Brown.epub")
-        // ou "pt" / "pt-PT", analisa amostra do texto e mapeia português para "pt-BR" conforme solicitado.
         val sampleText = finalParagraphs.take(40).joinToString(" ") { it.text }
         val detectedLang = detectLanguageBcp47(opfMeta.language, sampleText)
 
@@ -137,43 +131,32 @@ class EpubParser {
         isHtmlHeaderTag: Boolean,
         out: MutableList<Pair<String, Boolean>>
     ) {
+        if (isHtmlHeaderTag) {
+            out.add(paragraphText to true)
+            return
+        }
+
         val match = chapterHeadingRegex.find(paragraphText)
         if (match == null) {
-            out.add(paragraphText to isHtmlHeaderTag)
+            out.add(paragraphText to false)
             return
         }
 
+        val heading = match.groupValues[1].trim()
         val before = paragraphText.substring(0, match.range.first).trim()
-        val heading = match.value.trim()
-        val after = paragraphText.substring(match.range.last + 1).trim()
 
-        // Se o parágrafo inteiro é exatamente o título do capítulo (ex: "PRÓLOGO" ou "CAPÍTULO DOIS")
-        if (before.isEmpty() && after.isEmpty()) {
+        if (before.isEmpty()) {
             out.add(heading to true)
-            return
-        }
-
-        // Se "CAPÍTULO UM" veio colado no fim do parágrafo anterior (como ocorre no EPUB de teste)
-        if (before.isNotEmpty() && after.isEmpty()) {
+        } else {
             out.add(before to false)
             out.add(heading to true)
-            return
         }
-
-        // Se o título veio no início seguido de texto
-        if (before.isEmpty() && after.isNotEmpty()) {
-            out.add(heading to true)
-            out.add(after to false)
-            return
-        }
-
-        out.add(paragraphText to isHtmlHeaderTag)
     }
 
     private fun detectLanguageBcp47(opfLang: String, sampleText: String): String {
         val normalizedOpf = opfLang.trim().lowercase()
         if (normalizedOpf.startsWith("pt")) {
-            return "pt-BR" // Sempre utiliza Português Brasileiro quando o livro é em português
+            return "pt-BR"
         }
 
         val lowerSample = " ${sampleText.lowercase()} "
