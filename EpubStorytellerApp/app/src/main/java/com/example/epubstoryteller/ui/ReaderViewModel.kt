@@ -58,7 +58,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             if (nextIndex <= book.paragraphs.lastIndex && _uiState.value.isPlaying) {
                 progressStore.saveBookPosition(book.bookId, nextIndex)
                 _uiState.update { it.copy(currentParagraphIndex = nextIndex) }
-                speakParagraphAt(nextIndex)
+                speakParagraphAt(nextIndex, flushExistingAudio = false)
             } else {
                 _uiState.update { it.copy(isPlaying = false, connectionStatus = "Fim do livro alcançado") }
                 syncForegroundService(isPlaying = false, paragraphIndex = finishedIndex)
@@ -226,7 +226,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         syncForegroundService(isPlaying = false, paragraphIndex = _uiState.value.currentParagraphIndex)
     }
 
-    private fun speakParagraphAt(index: Int) {
+    private fun speakParagraphAt(index: Int, flushExistingAudio: Boolean = true) {
         val state = _uiState.value
         val book = state.book ?: return
         val paragraph = book.paragraphs.getOrNull(index) ?: return
@@ -236,7 +236,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             voiceName = state.selectedVoiceName,
             languageBcp47 = book.detectedLanguageBcp47,
             paragraphIndex = index,
-            paragraphText = paragraph.text
+            paragraphText = paragraph.text,
+            flushExistingAudio = flushExistingAudio
         )
     }
 

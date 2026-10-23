@@ -23,21 +23,19 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Cliente WebSocket bidirecional para o modelo `gemini-3.8-live` via API oficial BidiGenerateContent.
  *
- * Correções críticas de estabilidade para parágrafos longos (como em "O Retrato de Dorian Gray"):
- * 1. Fila Assíncrona de Áudio (`Channel<AudioQueueItem>`):
- *    - Antes, `AudioTrack.write(..., WRITE_BLOCKING)` era chamado diretamente na thread de leitura do WebSocket (`onMessage`).
- *    - Como o Gemini 3.8 Live gera o áudio muito mais rápido que o tempo real, em parágrafos longos (>15s de fala, como o 2º parágrafo
- *      do Capítulo I de Dorian Gray com 958 caracteres), o buffer do `AudioTrack` enchia e bloqueava a thread do WebSocket!
- *    - Com a thread do WebSocket bloqueada, o OkHttp não conseguia ler os pacotes `PONG` do `pingInterval`, disparando timeout no meio
- *      do parágrafo e reconectando/reiniciando o mesmo parágrafo em loop infinito.
- *    - Agora, `onMessage` nunca bloqueia: ele apenas enfileira os pacotes PCM em uma `Channel` consumida por uma coroutine dedicada de áudio.
- * 2. Subdivisão inteligente de parágrafos longos por frases (`splitIntoSpeechSegments`):
- *    - Parágrafos muito extensos (ex: >380 caracteres, chegando a 3.500 caracteres em Dorian Gray) são subdivididos em blocos naturais de
- *      frases (~350 caracteres) enviados sequencialmente dentro do mesmo parágrafo, garantindo fluidez contínua e zero cortes.
+ * Proteções contra corte das últimas palavras do parágrafo:
+ * 1. O buffer interno do `AudioTrack` comporta ~2 segundos de áudio (96.000 bytes). `AudioTrack.write()` retorna
+ *    assim que os bytes entram no buffer de memória, até 2 segundos ANTES de saírem fisicamente no alto-falante.
+ * 2. Agora monitoramos `totalFramesWritten` vs `audioTrack.playbackHeadPosition` em `waitForAudioTrackToDrain()`,
+ *    aguardando o alto-falante reproduzir 100% das amostras do parágrafo antes de avançar para o próximo.
+ * 3. No avanço automático entre parágrafos (`flushExistingAudio = false`), NÃO executamos `track.flush()`,
+ *    preservando qualquer cauda acústica final no DAC de áudio do Android. `flushLocalAudioBuffer()` só é
+ *    chamado quando o usuário muda manualmente de parágrafo ou pausa a leitura.
  */
 class GeminiLiveStorytellerClient(
     private val onParagraphStarted: (Int) -> Unit,
@@ -83,6 +81,9 @@ class GeminiLiveStorytellerClient(
     private val utteranceGenerationId = AtomicInteger(0)
     private val reconnectAttempts = AtomicInteger(0)
 
+    // Contador exato de frames PCM de 16 bits (1 frame = 2 bytes) enviados ao AudioTrack desde o último flush
+    private val totalFramesWritten = AtomicLong(0L)
+
     private var currentApiKey: String = ""
     private var currentVoiceName: String = "Sulafat"
     private var currentLanguageCode: String = "pt-BR"
@@ -111,12 +112,15 @@ class GeminiLiveStorytellerClient(
                         if (item.genId == utteranceGenerationId.get() && isPlaying.get()) {
                             val nextSegIdx = item.segmentIndex + 1
                             if (nextSegIdx < item.totalSegments) {
-                                // Avança imediatamente para o próximo bloco de frases dentro do mesmo parágrafo
-                                activeSegmentIndex.set(nextSegIdx)
-                                sendCurrentSegmentTurn(item.genId)
+                                // Aguarda o buffer do AudioTrack terminar de falar o segmento atual antes de pedir o próximo
+                                waitForAudioTrackToDrain(item.genId, extraPauseMs = 60L)
+                                if (isPlaying.get() && item.genId == utteranceGenerationId.get()) {
+                                    activeSegmentIndex.set(nextSegIdx)
+                                    sendCurrentSegmentTurn(item.genId)
+                                }
                             } else {
-                                // Parágrafo inteiro concluído: aguarda esvaziar o buffer final do AudioTrack e avança de parágrafo
-                                delay(220)
+                                // Aguarda 100% dos frames no buffer de 2 segundos do AudioTrack saírem no alto-falante!
+                                waitForAudioTrackToDrain(item.genId, extraPauseMs = 180L)
                                 if (isPlaying.get() && item.genId == utteranceGenerationId.get()) {
                                     onParagraphFinished(item.paragraphIndex)
                                 }
@@ -125,6 +129,38 @@ class GeminiLiveStorytellerClient(
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Aguarda até que o `playbackHeadPosition` do `AudioTrack` alcance `totalFramesWritten`,
+     * garantindo que nenhuma sílaba ou palavra final que ainda estava nos 2 segundos de buffer
+     * de hardware seja cortada ao mudar para o próximo parágrafo.
+     */
+    private suspend fun waitForAudioTrackToDrain(genId: Int, extraPauseMs: Long) {
+        val track = audioTrack ?: return
+        if (track.state != AudioTrack.STATE_INITIALIZED) return
+
+        val targetFrames = totalFramesWritten.get()
+        val startWaitMs = System.currentTimeMillis()
+        val maxWaitMs = 3500L
+
+        while (isPlaying.get() && genId == utteranceGenerationId.get()) {
+            val playedFrames = try {
+                track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            } catch (_: Exception) {
+                targetFrames
+            }
+            val remainingFrames = targetFrames - playedFrames
+            if (remainingFrames <= 0L) break
+            if (System.currentTimeMillis() - startWaitMs > maxWaitMs) break
+
+            val sleepMs = ((remainingFrames * 1000L) / SAMPLE_RATE_HZ).coerceIn(20L, 80L)
+            delay(sleepMs)
+        }
+
+        if (extraPauseMs > 0 && isPlaying.get() && genId == utteranceGenerationId.get()) {
+            delay(extraPauseMs)
         }
     }
 
@@ -164,17 +200,23 @@ class GeminiLiveStorytellerClient(
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
+        totalFramesWritten.set(0L)
         track.play()
         audioTrack = track
         return track
     }
 
+    /**
+     * @param flushExistingAudio `true` quando o usuário clicou manualmente em outro parágrafo (interrompe na hora);
+     *                           `false` quando o leitor avançou naturalmente ao terminar o parágrafo anterior (sem cortar a cauda de áudio).
+     */
     fun connectAndSpeakParagraph(
         apiKey: String,
         voiceName: String,
         languageBcp47: String,
         paragraphIndex: Int,
-        paragraphText: String
+        paragraphText: String,
+        flushExistingAudio: Boolean = true
     ) {
         if (apiKey.isBlank()) {
             onError("Informe sua chave de API do Gemini nas configurações.")
@@ -188,8 +230,10 @@ class GeminiLiveStorytellerClient(
         activeSegmentIndex.set(0)
         val genId = utteranceGenerationId.incrementAndGet()
 
-        resetAudioQueue()
-        flushLocalAudioBuffer()
+        if (flushExistingAudio) {
+            resetAudioQueue()
+            flushLocalAudioBuffer()
+        }
         onParagraphStarted(paragraphIndex)
 
         val sessionExpired = (System.currentTimeMillis() - sessionConnectedAtMs) > SESSION_MAX_AGE_MS
@@ -206,10 +250,6 @@ class GeminiLiveStorytellerClient(
         }
     }
 
-    /**
-     * Divide parágrafos muito longos (ex: >380 caracteres) em blocos naturais de frases (terminadas em ., !, ?, ;, :)
-     * para evitar turnos gigantescos na Live API e manter a entonação consistente do início ao fim do parágrafo.
-     */
     private fun splitIntoSpeechSegments(text: String): List<String> {
         val cleaned = text.trim()
         if (cleaned.length <= MAX_SEGMENT_CHARS) {
@@ -322,7 +362,7 @@ class GeminiLiveStorytellerClient(
             RESPOND IN PORTUGUESE (BRAZIL). YOU MUST RESPOND UNMISTAKABLY IN PORTUGUESE (BRAZIL) WITH AN AUTHENTIC BRAZILIAN PORTUGUESE ACCENT (pt-BR).
             Você é um narrador profissional de audiolivros (estilo Storyteller) em Português do Brasil (pt-BR).
             REGRAS ESTRITAS DE NARRAÇÃO:
-            1. Leia APENAS e FIELMENTE o trecho enviado pelo usuário, palavra por palavra, do início ao fim.
+            1. Leia APENAS e FIELMENTE o trecho enviado pelo usuário, palavra por palavra, do início ao fim, pronunciando claramente até a última sílaba da última palavra.
             2. NUNCA adicione introduções ("Claro, vou ler", "Aqui está"), comentários, resumos ou encerramentos.
             3. Use entonação envolvente de contador de histórias (storyteller): dê vida aos diálogos, faça pausas dramáticas naturais na pontuação e transmita a emoção e o suspense da cena.
             4. Mesmo que o texto escrito contenha grafia de Portugal (ex: "facto", "exacto", "estava a olhar"), pronuncie com sotaque e fonética natural do Português Brasileiro (pt-BR).
@@ -330,7 +370,7 @@ class GeminiLiveStorytellerClient(
         } else {
             """
             You are a professional audiobook storyteller.
-            Read ONLY the exact text provided by the user, verbatim from start to finish, with rich storytelling emotion, natural pacing, and distinct character cadence. Never add introductory or concluding remarks.
+            Read ONLY the exact text provided by the user, verbatim from start to finish, pronouncing clearly through the very last word, with rich storytelling emotion. Never add introductory or concluding remarks.
             """.trimIndent()
         }
 
@@ -373,7 +413,7 @@ class GeminiLiveStorytellerClient(
         val segLabel = if (segments.size > 1) " (parte ${segIdx + 1}/${segments.size})" else ""
         onConnectionStatusChanged("Narrando parágrafo #${paraIdx + 1}$segLabel")
 
-        val promptText = "NARRE LITERALMENTE ESTE TRECHO:\n\n$segmentText"
+        val promptText = "NARRE LITERALMENTE ESTE TRECHO ATÉ A ÚLTIMA PALAVRA:\n\n$segmentText"
         val clientContentMsg = JSONObject().apply {
             put("clientContent", JSONObject().apply {
                 put("turns", JSONArray().put(JSONObject().apply {
@@ -392,10 +432,6 @@ class GeminiLiveStorytellerClient(
         }
     }
 
-    /**
-     * Executado na thread do WebSocket: NUNCA bloqueia!
-     * Apenas decodifica o Base64 e envia para a `audioChannel` (memória) em microssegundos.
-     */
     private fun handleServerMessageNonBlocking(rawJson: String) {
         val expectedGenId = utteranceGenerationId.get()
         try {
@@ -467,7 +503,6 @@ class GeminiLiveStorytellerClient(
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             track.play()
         }
-        // Escreve em pequenos blocos de 4800 bytes (100ms a 24kHz 16-bit mono) para permitir interrupção imediata
         var offset = 0
         val chunkSize = 4800
         while (offset < pcmBytes.size && isPlaying.get() && genId == utteranceGenerationId.get()) {
@@ -475,6 +510,7 @@ class GeminiLiveStorytellerClient(
             val written = track.write(pcmBytes, offset, len, AudioTrack.WRITE_BLOCKING)
             if (written <= 0) break
             offset += written
+            totalFramesWritten.addAndGet((written / 2).toLong())
         }
     }
 
@@ -495,6 +531,7 @@ class GeminiLiveStorytellerClient(
                 if (track.state == AudioTrack.STATE_INITIALIZED) {
                     track.pause()
                     track.flush()
+                    totalFramesWritten.set(0L)
                     track.play()
                 }
             }
