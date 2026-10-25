@@ -39,4 +39,12 @@ class ReadingProgressStore(context: Context) {
     fun getVoiceName(): String {
         return prefs.getString("storyteller_voice_name", "Sulafat") ?: "Sulafat"
     }
+
+    fun saveLastBookFileName(fileName: String) {
+        prefs.edit().putString("last_user_epub_filename", fileName).apply()
+    }
+
+    fun getLastBookFileName(): String? {
+        return prefs.getString("last_user_epub_filename", null)
+    }
 }

@@ -36,7 +36,7 @@ object StorytellerVoices {
     // mais adequadas para narração de livros (Storyteller)
     val DEFAULT_VOICES = listOf(
         VoiceOption("Sulafat", "Sulafat (Storyteller Calorosa / Envolvente)", "Timbre quente e expressivo, excelente para romances e suspense"),
-        VoiceOption("Charon", "Charon (Narrador Grave / Misterioso)", "Voz profunda, firme e imersiva, ideal para thrillers como O Código Da Vinci"),
+        VoiceOption("Charon", "Charon (Narrador Grave / Misterioso)", "Voz profunda, firme e imersiva, ideal para romances de mistério e suspense"),
         VoiceOption("Vindemiatrix", "Vindemiatrix (Narradora Suave / Contadora de Histórias)", "Entonação gentil e cadenciada para leitura longa"),
         VoiceOption("Sadaltager", "Sadaltager (Narrador Erudito / Clássico)", "Tom articulado e dramático"),
         VoiceOption("Aoede", "Aoede (Narradora Natural / Fluida)", "Leitura fluida e dinâmica"),

@@ -84,7 +84,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         StorytellerPlaybackService.onPrevParagraphCommand = { skipRelative(-1) }
         StorytellerPlaybackService.onNextParagraphCommand = { skipRelative(1) }
 
-        loadBundledSampleEpub()
+        restoreLastOpenedBookIfPresent()
         refreshExtendedVoicesIfKeyPresent()
     }
 
@@ -106,13 +106,27 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         )
     }
 
-    fun loadBundledSampleEpub() {
+    private fun restoreLastOpenedBookIfPresent() {
         viewModelScope.launch {
+            val app = getApplication<Application>()
+            val cachedBookFile = java.io.File(app.filesDir, "last_user_book.epub")
+            if (!cachedBookFile.exists() || cachedBookFile.length() == 0L) {
+                _uiState.update {
+                    it.copy(
+                        isLoadingBook = false,
+                        book = null,
+                        connectionStatus = "Abra um arquivo EPUB para iniciar"
+                    )
+                }
+                return@launch
+            }
+
             _uiState.update { it.copy(isLoadingBook = true, errorMessage = null) }
             try {
+                val savedFileName = progressStore.getLastBookFileName() ?: "livro.epub"
                 val parsedBook = withContext(Dispatchers.IO) {
-                    getApplication<Application>().assets.open("O_Codigo_da_Vinci.epub").use { stream ->
-                        epubParser.parse(stream, "O Codigo da Vinci - Dan Brown.epub")
+                    cachedBookFile.inputStream().use { stream ->
+                        epubParser.parse(stream, savedFileName)
                     }
                 }
                 applyLoadedBook(parsedBook)
@@ -120,7 +134,38 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update {
                     it.copy(
                         isLoadingBook = false,
-                        errorMessage = "Erro ao abrir EPUB de teste: ${e.localizedMessage}"
+                        book = null,
+                        connectionStatus = "Abra um arquivo EPUB para iniciar"
+                    )
+                }
+            }
+        }
+    }
+
+    fun loadBundledClassicEpub() {
+        viewModelScope.launch {
+            pause()
+            _uiState.update { it.copy(isLoadingBook = true, errorMessage = null) }
+            try {
+                val app = getApplication<Application>()
+                val cachedBookFile = java.io.File(app.filesDir, "last_user_book.epub")
+                val parsedBook = withContext(Dispatchers.IO) {
+                    app.assets.open("O_Retrato_de_Dorian_Gray.epub").use { assetStream ->
+                        cachedBookFile.outputStream().use { out ->
+                            assetStream.copyTo(out)
+                        }
+                    }
+                    progressStore.saveLastBookFileName("O Retrato de Dorian Gray - Oscar Wilde.epub")
+                    cachedBookFile.inputStream().use { stream ->
+                        epubParser.parse(stream, "O Retrato de Dorian Gray - Oscar Wilde.epub")
+                    }
+                }
+                applyLoadedBook(parsedBook)
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoadingBook = false,
+                        errorMessage = "Erro ao abrir livro clássico: ${e.localizedMessage}"
                     )
                 }
             }
@@ -132,11 +177,20 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             pause()
             _uiState.update { it.copy(isLoadingBook = true, errorMessage = null) }
             try {
+                val app = getApplication<Application>()
+                val cachedBookFile = java.io.File(app.filesDir, "last_user_book.epub")
+                val fileName = uri.lastPathSegment ?: "livro.epub"
                 val parsedBook = withContext(Dispatchers.IO) {
-                    val resolver = getApplication<Application>().contentResolver
+                    val resolver = app.contentResolver
                     resolver.openInputStream(uri)?.use { stream ->
-                        epubParser.parse(stream, uri.lastPathSegment ?: "livro.epub")
+                        cachedBookFile.outputStream().use { out ->
+                            stream.copyTo(out)
+                        }
                     } ?: throw IllegalArgumentException("Não foi possível ler o arquivo selecionado")
+                    progressStore.saveLastBookFileName(fileName)
+                    cachedBookFile.inputStream().use { stream ->
+                        epubParser.parse(stream, fileName)
+                    }
                 }
                 applyLoadedBook(parsedBook)
             } catch (e: Exception) {
